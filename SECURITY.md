@@ -1,116 +1,175 @@
-# Hold: architecture and the session-hijack patch
+# SwapShelf: architecture and the authorization patch
 
-Hold is a campus office-hours board. A TA posts a twenty-minute slot. A student holds it, reads a private note if the TA left one, cancels, or passes the seat to another student.
+SwapShelf is a campus buy/sell board. A student posts a listing, the public board shows it, another student messages them, and the seller marks it sold. A private seller note can hold a pickup detail that is not part of the public description. The department desk holds a separate note for staff accounts.
 
-The original board treated the login cookie as a URL parameter and changed bookings on GET. Both of those let someone else read Lea's private note (`HOLD-2291`). This repo is the patched app. Normal hold, cancel, transfer, and sign-out still work.
+Two checks in the uploaded views and forms were missing. Any signed-in student could open, edit, sell, or remove somebody else's listing and could read or write any message thread. The profile form also wrote Django's `is_staff` bit, so the same student could open the department desk. This repo is the patched app. Posting, editing your own listing, marking it sold, messaging the other party, registration, and sign-in still work.
 
 ## Architecture
 
 ```
 Browser
-  |  hold_session cookie (HttpOnly, SameSite=Lax)
-  |  hold_flash cookie (signed Flask session: flash messages + CSRF token)
+  |  session cookie (Django session, HttpOnly)
   v
-Flask (app.py)
-  before each request: look up hold_session in SQLite, attach the user
-  routes: board, register, login, logout, book, booking detail,
-          cancel, transfer, one-time device link
+Django (market/views.py)
+  home, listing detail          public
+  register, sign in, sign out   public; sign-out is POST
+  post, edit, sold, remove      login + listing.owner
+  message thread                login + buyer or listing owner
+  profile                       login; writes name and email only
+  desk                          login + is_staff
   v
-SQLite (data/officehours.db)
-  users, slots, bookings, sessions, handoff_codes
+SQLite (data/swapshelf.db)
+  auth_user, market_listing, market_thread, market_message
 ```
 
-Passwords are stored with Werkzeug hashes. The login record is a random 48-character hex token in `sessions`, not a copy of the password. Jinja escapes text on the way out, and every SQL statement uses parameters.
+Passwords are Django password hashes. `UserCreationForm` and `AuthenticationForm` handle register and sign-in. State-changing forms use Django's CSRF token.
 
-### How a login becomes a cookie
+### How a listing id becomes a row
 
-1. The browser POSTs email and password to `/login`, plus a CSRF token that was rendered into the form.
-2. The server looks up the user and checks the password hash.
-3. It inserts a new row in `sessions` (`token`, `user_id`) and sends:
+The board links to `/listings/<pk>/`. `listing_detail` loads that primary key and no other condition:
 
-   `Set-Cookie: hold_session=<token>; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600`
+```python
+def listing_detail(request, pk):
+    listing = get_object_or_404(Listing, pk=pk)
+```
 
-4. The browser stores that cookie and sends it back on later requests to this host.
-5. `before_request` reads only that cookie, joins `sessions` to `users`, and sets the current user.
-6. Sign-out deletes that `sessions` row and clears the cookie. Replaying a copied cookie after sign-out does nothing.
+`pk` is the `market_listing.id` column. The row's `owner_id` points at `auth_user`. The public template renders title, description, price, category, status, and the seller's name. It does not render `seller_note`.
 
-`hold_flash` is a different cookie. Flask signs it with `SECRET_KEY` and uses it for flash messages and the CSRF token. Knowing that key does not let you mint a `hold_session`. The login token is random and checked against the database.
+The same integer is reused for the edit, sold, remove, and "message seller" routes. Edit and sold used to load the row with that id alone. They now also require `owner=request.user`. "Message seller" still loads any listing, then creates a thread whose buyer is the signed-in user. Opening a thread requires that user to be the buyer or the listing owner.
 
-### Public board vs booking detail
+Home is `Listing.objects.exclude(status="removed")`, optionally filtered with `?category=`. Sold rows stay on the board. The category value is a bound query parameter, not SQL text.
 
-`GET /` lists every slot: when, which TA, topic, where, and whether someone already holds it. It does not include the holder's email or `bookings.private_note`.
+### Which pages a logged-out visitor can open
 
-`GET /bookings/<id>` is the private page. The holding student sees the time, place, and the TA note when one exists. The TA who posted that slot can open it to see who booked, and the note is left out of their HTML. Anyone else gets "Not allowed". Lea's seeded note is the makeup-exam line that ends with release code `HOLD-2291`.
+| Request | Who |
+| --- | --- |
+| `GET /` | Anyone. Public cards, no seller notes. |
+| `GET /listings/<pk>/` | Anyone. Public description only. |
+| `GET /login/`, `POST /login/` | Anyone. |
+| `GET /register/`, `POST /register/` | Anyone. A new account is not staff. |
+| `POST /logout/` | Anyone. Clears the session. |
 
-### Which actions change server state
+`GET /listings/new/`, edit, sold, remove, `/me/`, threads, profile, and `/desk/` are wrapped in `login_required` and redirect to `/login/`. Sold, remove, and sign-out also require POST.
 
-| Action | Request | What changes |
-|---|---|---|
-| Hold a slot | `POST /slots/<id>/book` | Inserts a `bookings` row |
-| Cancel | `POST /bookings/<id>/cancel` | Deletes that row |
-| Transfer | `POST /bookings/<id>/transfer` | Sets `student_id` to the classmate |
-| Post a slot | `POST /slots` | TA inserts a `slots` row |
-| Sign out | `POST /logout` | Deletes the `sessions` row |
-| Device link | `POST /me`, then `GET /handoff/<code>` | Stores a one-time code, then inserts a new `sessions` row |
+### What the profile form writes back to the user
 
-GET requests for cancel and transfer only redirect back to the booking. They do not write to the database. Each POST that changes state also requires the CSRF token from the signed `hold_flash` cookie.
+The profile view binds the form to `request.user` and saves that same row. It never takes a user id from the query string.
 
-An intentional transfer keeps the private note on the booking, so the classmate who will actually attend can read what the TA left. That only happens after the current holder submits the form.
+The uploaded form wrote four fields:
+
+```python
+class ProfileForm(forms.ModelForm):
+    class Meta:
+        model = User
+        fields = ["first_name", "last_name", "email", "is_staff"]
+        labels = {
+            "is_staff": "Show my name on the department board",
+        }
+```
+
+`first_name`, `last_name`, and `email` are the name and address shown on listings. `is_staff` is Django's staff flag. The label called it a department-board opt-in. The desk does not list names, so the checkbox did not do what it said. Saving the form with the box checked set `User.is_staff = True` on the signed-in account.
+
+The patched form only includes `first_name`, `last_name`, and `email`. The view also puts the previous `is_staff` and `is_superuser` values back before it saves, so a posted `is_staff=on` or `is_superuser=on` does not stick.
+
+### What the department desk is for, and who can open it
+
+`/desk/` is the department hold closet note (reimbursement code included). It is not a second public board.
+
+```python
+@login_required
+def desk(request):
+    if not request.user.is_staff:
+        return render(request, "market/desk.html", {"allowed": False})
+    return render(
+        request,
+        "market/desk.html",
+        {
+            "allowed": True,
+            "note": "Department hold closet, Hullihen basement cage B. Reimbursement code DESK-2290. Not for the public board.",
+        },
+    )
+```
+
+A signed-in student who is not staff gets "This page is for department board accounts." and does not receive the note. The nav link is rendered only when `user.is_staff`. The desk check itself was already the right gate. The hole was the profile form turning that flag on.
+
+Staff has to be set outside the profile page (the admin user, or `is_staff=True` on the account). Django admin is mounted at `/admin/` and uses the same flag. Demo accounts are not staff.
 
 ## The defect
 
-Two bugs in the original request handling chained into the same outcome: someone who is not Lea could read her TA note.
+Two bugs in the uploaded views and forms. Either one is enough to read a note that is not on the public board.
 
-### 1. The device link was the session cookie
+### 1. Listing and thread ids were not checked against the account
 
-My bookings rendered:
-
-```html
-<a href="/me?sid={{ session token }}">open my bookings on this browser</a>
-```
-
-And every request did this:
+Edit, mark sold, and remove loaded any listing:
 
 ```python
-token = request.args.get("sid") or request.cookies.get("hold_session")
+@login_required
+def listing_edit(request, pk):
+    listing = get_object_or_404(Listing, pk=pk)
+    form = ListingForm(request.POST or None, instance=listing)
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        return redirect("listing_detail", pk=listing.pk)
+    return render(request, "market/form.html", {"form": form, "heading": "Edit listing", "listing": listing})
+
+
+@login_required
+@require_POST
+def listing_sold(request, pk):
+    listing = get_object_or_404(Listing, pk=pk)
+    listing.status = "sold"
+    listing.save(update_fields=["status"])
+    return redirect("listing_detail", pk=listing.pk)
 ```
 
-If the lookup succeeded, the response set `hold_session` to that same value (`HttpOnly` was off, `SameSite` was `None`, and the cookie lived 14 days).
+Remove did the same lookup and set `status = "removed"`. The edit form includes `seller_note`, which the public listing page does not. The detail template also offered Edit and Mark sold to every signed-in visitor, not only the owner.
 
-The `sid` value was not a separate handoff code. It was the bearer token. It showed up in the HTML of an authenticated page, and once you opened the link it was also in the address bar, browser history, access logs, and the `Referer` header.
+Threads had the same shape. Any signed-in user could read the messages and append one:
+
+```python
+@login_required
+def thread_detail(request, pk):
+    thread = get_object_or_404(Thread.objects.select_related("listing", "buyer", "listing__owner"), pk=pk)
+    if request.method == "POST":
+        body = (request.POST.get("body") or "").strip()
+        if body:
+            Message.objects.create(thread=thread, sender=request.user, body=body)
+        return redirect("thread_detail", pk=thread.pk)
+```
 
 **How to trigger it on the unpatched app**
 
-1. Sign in as `lea@campus.edu` / `campus123`.
-2. Open My bookings and copy the device-handoff link. It looks like `http://<host>/me?sid=<48 hex characters>`.
-3. Open that URL in a private window, or send it to someone else.
-4. The private window is now Lea. Open **Exam review — limited seats**.
-5. The page includes: `Release code HOLD-2291. Do not forward this note.`
-6. The private window keeps the session after the query string is gone, because the response copied `sid` into `hold_session`. Lea's original browser stays signed in too. Nothing rotates or burns the token.
+1. Sign in as `jordan` / `campus123`.
+2. Open Alex's charger on the board and note the id, for example `/listings/1/`.
+3. Open `/listings/1/edit/`. The form's seller note is: `East vestibule locker 14, code SWAP-7741. Text when you are downstairs.`
+4. `POST /listings/1/sold/` marks Alex's charger sold. `POST /listings/1/delete/` takes it off the board.
+5. Sign in as `sam` / `foundit!` (Sam is not on the bike thread). Open `/threads/1/`. The page shows Jordan and Alex's messages about the bike. Sam can POST a reply into that thread.
 
-The same URL works on any path (`/?sid=<token>`), not only on My bookings.
+The bike message says the lock code is on the seller note, not in the thread. Reading the thread does not reveal `SWAP-7741`. The edit form does.
 
-`document.cookie` could also read `hold_session`, because the cookie was not `HttpOnly`.
+### 2. The profile form granted staff
 
-### 2. Cancel and transfer ran on GET
+The profile checkbox was `is_staff` under the label "Show my name on the department board". `profile` called `form.save()` on `request.user`.
 
-The booking page cancelled with a link and transferred with `method="get"`. Booking ids are `1`, `2`, `3`, … A logged-in holder who followed a link, or whose browser requested one, would change the booking. A top-level GET still sends a `SameSite=Lax` cookie, and the original cookie was `SameSite=None`, so a cross-site page could do it as well:
+**How to trigger it on the unpatched app**
 
-```html
-<img src="http://<host>/bookings/1/transfer?email=nico@campus.edu">
-```
+1. Register an account, or sign in as `sam` / `foundit!`. Sam is not staff. `/desk/` shows only "This page is for department board accounts."
+2. Open `/profile/`, check "Show my name on the department board", and save. The POST body includes `is_staff=on`.
+3. Open `/desk/`. The page now includes `Department hold closet, Hullihen basement cage B. Reimbursement code DESK-2290.`
+4. The same session can open `/admin/`, because Django treats `is_staff` as access to the admin site.
 
-That moves Lea's exam-review hold, private note included, to whoever owns that email. Nico then opens the booking and reads `HOLD-2291`. No password required. An image request to `/bookings/1/cancel` dropped the hold instead.
+Checking the box does not change another user's row. It changes the signed-in user's privileges. That is still the bug: the field is not a display preference.
+
+The desk view was not open to every account. A student who never set `is_staff` did not receive the note. The profile form was how they set it.
 
 ## The patch
 
-- The server ignores `sid`. The only login credential it accepts is the `hold_session` cookie.
-- That cookie is `HttpOnly` and `SameSite=Lax`. Sign-out deletes the database row and does not write the cookie back out.
-- My bookings no longer prints the session token. **Create a one-time device link** stores a SHA-256 hash of a separate random code for 15 minutes. Opening `/handoff/<code>` in the other browser inserts a new session for that user, sets a new cookie, and burns the code. A second open fails. The code is shown in a text field on the POST response, not in the address bar, and it is not the cookie value. Prefetching a normal link cannot burn it, because it is not an `<a href>`.
-- Cancel and transfer GET handlers do not write. The buttons are POST forms with a CSRF token. Book, post-slot, register, login, logout, and the handoff button use the same token.
-- A student can open only their own booking. The TA who owns the slot can see who booked. The private note is rendered only when the viewer is the holding student, and authenticated pages send `Cache-Control: no-store`.
-- Responses also send `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a content security policy that blocks framing and inline scripts.
+- `listing_edit`, `listing_sold`, and `listing_delete` load with `owner=request.user`. A miss is a 404. The listing is not changed.
+- `thread_detail` loads the thread only when `buyer` is the user or `listing.owner` is the user. Anyone else gets a 404, including on POST, so they cannot insert a message.
+- The listing page shows Edit and Mark sold only when `user == listing.owner`. Message seller stays available to any signed-in student. The server checks are what stop a direct POST.
+- `ProfileForm` fields are `first_name`, `last_name`, and `email`. `profile` copies `is_staff` and `is_superuser` from the row before save and writes those values back.
+- The desk view is unchanged. Non-staff still see the denial line. Staff still see the closet note.
 
-What still works: register with a `.edu` address, sign in, hold an open slot, read your own note, cancel, transfer to a classmate by email, TA posting, and moving a session to another browser with the one-time link.
+What still works: register, sign in, sign out, the public category filter, posting a listing, editing and marking sold as the owner, the owner reading their own seller note, and a buyer/seller thread. Starting a thread on someone else's listing is the message-seller action and is still allowed.
 
-`python -m unittest discover -s tests -t .` covers the note staying off the public board, the `sid` replay, GET cancel/transfer, a missing CSRF token, a real cancel and transfer, one-time and expired handoff, logout invalidating the cookie, and the TA path.
+`python manage.py test` covers the seller note staying off the public listing, Jordan's failure to edit or sell Alex's charger, Sam's failure to read the bike thread, Alex posting and marking a new listing sold, both sides of a new thread, a profile POST that includes `is_staff` and `is_superuser`, the closed desk, a real staff account opening the desk, and register plus sign-in.

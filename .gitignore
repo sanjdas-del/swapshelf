@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 data/*.db
+*.sqlite3
 .pytest_cache/
